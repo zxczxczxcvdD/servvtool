@@ -1,1 +1,1 @@
-python servtoolki.py
+web: gunicorn servtoolki:app
