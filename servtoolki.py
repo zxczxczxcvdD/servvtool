@@ -1,70 +1,133 @@
 from flask import Flask, request, jsonify
-from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime, timedelta
-import random
-import string
 import json
 import os
+import hashlib
+from datetime import datetime, timedelta
+import string
+import random
+import logging
 
 app = Flask(__name__)
 
-# Путь к JSON-файлу для хранения данных
-DATA_FILE = "auth_data.json"
-# Пин-код для генерации ключей
-PIN_CODE = "1312"
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Инициализация данных
-def init_data():
-    if not os.path.exists(DATA_FILE):
-        data = {"users": [], "keys": []}
-        with open(DATA_FILE, 'w') as f:
-            json.dump(data, f, indent=4)
+# Пути к JSON-файлам
+USERS_FILE = "users.json"
+KEYS_FILE = "keys.json"
+
+# Инициализация JSON-файлов
+def init_files():
+    if not os.path.exists(USERS_FILE):
+        logger.info("Создание users.json")
+        with open(USERS_FILE, 'w') as f:
+            json.dump({}, f)
+    if not os.path.exists(KEYS_FILE):
+        logger.info("Создание keys.json")
+        with open(KEYS_FILE, 'w') as f:
+            json.dump({}, f)
 
 # Загрузка данных из JSON
-def load_data():
-    with open(DATA_FILE, 'r') as f:
-        return json.load(f)
+def load_json(file_path):
+    try:
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Ошибка чтения {file_path}: {str(e)}")
+        return {}
 
 # Сохранение данных в JSON
-def save_data(data):
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=4)
+def save_json(file_path, data):
+    try:
+        with open(file_path, 'w') as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        logger.error(f"Ошибка записи {file_path}: {str(e)}")
 
-# Очистка просроченных аккаунтов
+# Хеширование пароля
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+# Проверка срока действия аккаунта
+def is_account_valid(expiry_date):
+    if expiry_date == "permanent":
+        return True
+    try:
+        expiry = datetime.fromisoformat(expiry_date)
+        return datetime.now() < expiry
+    except ValueError:
+        logger.error(f"Неверный формат expiry_date: {expiry_date}")
+        return False
+
+# Удаление истекших аккаунтов
 def clean_expired_accounts():
-    data = load_data()
-    current_time = datetime.now()
-    data["users"] = [
-        user for user in data["users"]
-        if not user["expires_at"] or datetime.strptime(user["expires_at"], '%Y-%m-%d %H:%M:%S.%f') > current_time
-    ]
-    save_data(data)
+    users = load_json(USERS_FILE)
+    updated = False
+    for username, data in list(users.items()):
+        if not is_account_valid(data["expiry_date"]):
+            del users[username]
+            updated = True
+            logger.info(f"Удален истекший аккаунт: {username}")
+    if updated:
+        save_json(USERS_FILE, users)
 
-# Генерация ключа
-@app.route('/generate_key', methods=['POST'])
+# Генерация ключа по формуле
 def generate_key():
+    return "SKY-" + ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(24))
+
+# Маршрут для создания ключа
+@app.route('/generate_key', methods=['POST'])
+def generate_key_route():
     data = request.get_json()
-    pin = data.get('pin')
-    duration_days = data.get('duration_days')
+    duration = data.get('duration')
 
-    if pin != PIN_CODE:
-        return jsonify({"error": "Неверный пин-код"}), 403
+    if duration not in [13, 30, "permanent"]:
+        logger.warning(f"Неверный срок действия: {duration}")
+        return jsonify({"error": "Неверный срок действия. Допустимые значения: 13, 30, permanent"}), 400
 
-    if duration_days not in [0, 13, 30]:
-        return jsonify({"error": "Недопустимый срок действия ключа"}), 400
+    keys = load_json(KEYS_FILE)
+    key = generate_key()
+    while key in keys:
+        key = generate_key()
+        logger.debug(f"Повтор ключа, генерируем новый: {key}")
 
-    key = "SKY-" + ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(24))
-    auth_data = load_data()
-    auth_data["keys"].append({
-        "key": key,
-        "duration_days": duration_days,
+    keys[key] = {
+        "duration": duration,
         "used": False
-    })
-    save_data(auth_data)
+    }
+    save_json(KEYS_FILE, keys)
+    logger.info(f"Сгенерирован ключ: {key}, срок: {duration}")
 
-    return jsonify({"key": key, "duration_days": duration_days}), 200
+    return jsonify({"key": key, "duration": duration}), 200
 
-# Регистрация
+# Маршрут для входа
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username or not password:
+        logger.warning("Отсутствует имя пользователя или пароль")
+        return jsonify({"error": "Имя пользователя и пароль обязательны"}), 400
+
+    clean_expired_accounts()
+    users = load_json(USERS_FILE)
+
+    if username in users and users[username]["password"] == hash_password(password):
+        if is_account_valid(users[username]["expiry_date"]):
+            logger.info(f"Успешный вход: {username}")
+            return jsonify({"message": "Вход успешен"}), 200
+        else:
+            del users[username]
+            save_json(USERS_FILE, users)
+            logger.info(f"Удален истекший аккаунт при входе: {username}")
+            return jsonify({"error": "Аккаунт истёк"}), 401
+    logger.warning(f"Неуспешный вход: {username}")
+    return jsonify({"error": "Неверное имя пользователя или пароль"}), 401
+
+# Маршрут для регистрации
 @app.route('/register', methods=['POST'])
 def register():
     data = request.get_json()
@@ -73,67 +136,43 @@ def register():
     password = data.get('password')
 
     if not key or not username or not password:
-        return jsonify({"error": "Необходимы ключ, имя пользователя и пароль"}), 400
+        logger.warning("Отсутствует ключ, имя пользователя или пароль")
+        return jsonify({"error": "Ключ, имя пользователя и пароль обязательны"}), 400
 
     clean_expired_accounts()
-    auth_data = load_data()
+    keys = load_json(KEYS_FILE)
+    users = load_json(USERS_FILE)
 
-    # Проверка ключа
-    key_data = next((k for k in auth_data["keys"] if k["key"] == key), None)
-    if not key_data:
-        return jsonify({"error": "Недействительный ключ"}), 400
-    if key_data["used"]:
-        return jsonify({"error": "Ключ уже использован"}), 400
+    if key not in keys:
+        logger.warning(f"Неверный ключ: {key}")
+        return jsonify({"error": "Неверный ключ"}), 401
 
-    # Проверка уникальности имени пользователя
-    if any(user["username"] == username for user in auth_data["users"]):
+    if keys[key]["used"]:
+        logger.warning(f"Ключ уже использован: {key}")
+        return jsonify({"error": "Ключ уже использован"}), 401
+
+    if username in users:
+        logger.warning(f"Имя пользователя занято: {username}")
         return jsonify({"error": "Имя пользователя уже занято"}), 400
 
-    # Вычисление срока действия
-    duration_days = key_data["duration_days"]
-    expires_at = None if duration_days == 0 else (datetime.now() + timedelta(days=duration_days)).strftime('%Y-%m-%d %H:%M:%S.%f')
+    duration = keys[key]["duration"]
+    if duration == "permanent":
+        expiry_date = "permanent"
+    else:
+        expiry_date = (datetime.now() + timedelta(days=duration)).isoformat()
 
-    # Регистрация пользователя
-    auth_data["users"].append({
-        "username": username,
-        "password": generate_password_hash(password),
-        "created_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'),
-        "expires_at": expires_at
-    })
+    users[username] = {
+        "password": hash_password(password),
+        "expiry_date": expiry_date
+    }
+    keys[key]["used"] = True
 
-    # Отметка ключа как использованного
-    key_data["used"] = True
-    save_data(auth_data)
+    save_json(USERS_FILE, users)
+    save_json(KEYS_FILE, keys)
+    logger.info(f"Успешная регистрация: {username}, ключ: {key}")
 
     return jsonify({"message": "Регистрация успешна"}), 200
 
-# Логин
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    username = data.get('username')
-    password = data.get('password')
-
-    if not username or not password:
-        return jsonify({"error": "Необходимы имя пользователя и пароль"}), 400
-
-    clean_expired_accounts()
-    auth_data = load_data()
-
-    user = next((u for u in auth_data["users"] if u["username"] == username), None)
-    if not user:
-        return jsonify({"error": "Пользователь не найден"}), 404
-
-    if user["expires_at"] and datetime.strptime(user["expires_at"], '%Y-%m-%d %H:%M:%S.%f') < datetime.now():
-        auth_data["users"] = [u for u in auth_data["users"] if u["username"] != username]
-        save_data(auth_data)
-        return jsonify({"error": "Аккаунт просрочен и удален"}), 403
-
-    if check_password_hash(user["password"], password):
-        return jsonify({"message": "Вход успешен"}), 200
-    else:
-        return jsonify({"error": "Неверный пароль"}), 401
-
 if __name__ == "__main__":
-    init_data()
-    app.run(host='0.0.0.0', port=5000)
+    init_files()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
